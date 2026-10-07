@@ -61,33 +61,125 @@ if that is set.
 
 ### ELLIOT-Pretrain needs corrected metadata
 
-The current Source Cooperative release of ELLIOT-Pretrain has no `ml:contract` in its
-`COLLECTION.json`. It also predates fixes to its frame metadata, among them the burst
-frame dates. To use its pixels, pass a **metadata overlay**: a directory (or an
-`hf://` spec) holding `<part>/COLLECTION.json` and `<part>/METADATA/` in the
-corrected form. The overlay replaces the release's metadata and the pixels are still
-read from the release:
+The current Source Cooperative release of ELLIOT-Pretrain cannot be read as it is
+published, for two reasons.
+
+- Its `COLLECTION.json` has no `ml:contract`, so a typed reader does not know what
+  its bands, units and classes are.
+- Its frame metadata has known errors. The worst is in `burst`, where nearly every
+  tile's cell identity and acquisition rows belong to another tile.
+
+So the package reads the release's **pixels** together with **corrected metadata**,
+supplied as a metadata overlay. The overlay holds, for each part,
+`<part>/COLLECTION.json` and `<part>/METADATA/*.parquet`, and nothing else. It is
+published as `elliot-pretrain-metadata-overlay.zip` (96 MB) in the Hugging Face
+dataset `isp-uv-es/elliot-x-ext`.
+
+You do not need to pass the overlay. Whenever an ELLIOT-Pretrain root's own
+`COLLECTION.json` has no `ml:contract`, the package downloads it once, uses it, and
+warns that it did:
 
 ```python
 et.configure(elliot='https://data.source.coop/major-tom/elliot-pretrain',
-             elliot_metadata='/path/to/elliot-pretrain-metadata',
              ext='hf://isp-uv-es/elliot-x-ext')
+# UserWarning: ... this release of Major TOM ELLIOT-Pretrain has no ml:contract and
+# carries the old frame metadata, so its corrected metadata is used instead, from
+# hf://isp-uv-es/elliot-x-ext/elliot-pretrain-metadata-overlay.zip ...
 ```
 
-Without the overlay, opening a part raises an error that says so.
+To use another overlay, pass `elliot_metadata=` (or set `ELLIOT_METADATA`). It can
+be a directory or a zip file, local or `hf://<org>/<repo>/<path>`. A root whose
+metadata already has an `ml:contract` is read as it is.
+
+### What the ELLIOT-Pretrain release would need to change
+
+The overlay becomes unnecessary once the release's own metadata matches it. Only
+metadata changes; no raster has to be rewritten. For each part (`monotemporal`,
+`monthly`, `burst`):
+
+1. **`COLLECTION.json`**
+   - Add `"taco:version": "3.0.0"`.
+   - Add an `ml:contract` declaring four input slots:
+     - `s2`: 13 bands, `scale_factor` 1e-4, TOA reflectance.
+     - `l8`: 11 bands, `scale_factor` 1e-4. B1-B9 are reflectance and B10-B11
+       brightness temperature in kelvin. The slot is optional in `monthly`, where
+       312 L8 rows are entirely null.
+     - `dem`: metres. No nodata value; 0 is a real elevation.
+     - `land_cover`: ESA WorldCover classes, 0 = no data.
+   - Rename the metadata levels from `collection`, `sample/s2`, `sample/l8` to
+     `sample`, `children`, `children/s2`, `children/l8`, `children/dem`,
+     `children/lc`.
+   - Correct the descriptions of five columns:
+     - `climate:temperature` is kelvin, not °C.
+     - `climate:precipitation` is metres per year, not mm per year.
+     - `soil:carbon`, `soil:bulk_density` and `soil:ph` are OpenLandMap's integer
+       encodings (×5 g/kg, ×10 kg/m³, pH ×10).
+     - `socio:gdp` is not per capita.
+   - Monotemporal only: say that the `lc` rasters write WorldCover's no data as 80
+     (permanent water), where `monthly` and `burst` write 0.
+2. **`METADATA/` file names**, following the TACO v3 levels:
+   - `collection.parquet` becomes `sample.parquet`;
+   - `sample.parquet` becomes `children.parquet`;
+   - `sample__{s2,l8,dem,lc}.parquet` become `children__{s2,l8,dem,lc}.parquet`.
+3. **Columns**
+   - Rename `geometry` to `ml:geometry`, in the sample level and in the S2 and L8
+     frame levels.
+   - In the S2 and L8 frame levels, rename `stac:crs`, `stac:geotransform`,
+     `stac:tensor_shape`, `stac:time_start` and `stac:time_end` to `ml:crs`,
+     `ml:geotransform`, `ml:tensor_shape`, `ml:time_start` and `ml:time_end`.
+   - Add `ml:tensor_shape` to the DEM and land-cover levels.
+4. **Values**
+   - **`burst`, cell order.** The cell block of the sample level (`majortom:code_*`,
+     `ml:geometry`, and every soil, climate, socio, terrain and admin column) is
+     joined to the wrong `DATA/` directories: 16,665 of 16,666 rows. The `window:*`
+     columns are permuted the same way.
+   - **`burst`, frame rows.** Every per-acquisition column of the S2 and L8 frame
+     rows (geometry, times, dates, product ids, scores, nodata, angles) is permuted
+     the same way: 99,822 of 99,996 S2 rows carry another tile's dates. The fix
+     moves them, frame for frame. CRS, geotransform and tensor shape stay, because
+     they are read off the files.
+   - **`monotemporal`, S2 timestamps.** 15,116 S2 `time_start`/`time_end` values are
+     in microseconds, not milliseconds. Divide them by 1,000.
+   - **`monotemporal`, frame geometry.** S2 geotransforms are wrong on 247,040 of
+     250,000 frames, with origins hundreds of km off. Take the CRS, geotransform and
+     tensor shape of every S2 and L8 frame from the file's own header.
+   - **`monotemporal`, paths and order.** The land-cover level's paths point to
+     `wc/data.tif`, a byte-identical duplicate of `lc/data.tif` (verified on all
+     250,000 tiles); point them to `lc/data.tif`. The L8 level is in scrambled row
+     order (row 0 is tile 225241); order it like its parent level.
+   - **`monthly` and `burst`, paths.** The DEM and land-cover levels give directory
+     paths (`0/dem`, `0/lc`) where the row is the file (`0/dem/main.tif`,
+     `0/lc/main.tif`).
+   - **All parts, soil.** Where the five soil columns are all 0 (exactly the rows
+     with pH 0: open water, Antarctica, Greenland), store null.
+
+Once a release carries this metadata, `taco.ml.Dataset` opens it directly and the
+package stops using the overlay automatically. The corrected files in the overlay
+can be adopted as they are: each `COLLECTION.json` lists these corrections in
+`ml:metadata_revision`.
 
 ## Install
 
 ```bash
-pip install "majortom-elliot-tasks[torch,hf] @ git+https://github.com/<org>/majortom-elliot-tasks"
+pip install "majortom-elliot-tasks[torch] @ git+https://github.com/elliot-project/majortom-elliot-tasks"
 # or, from a checkout
-pip install -e ".[torch,hf,examples,test]"
+pip install -e ".[torch,examples,test]"
 ```
 
 The package needs Python 3.12 or later. It reads through the `taco.ml` reader of the
-TACO fork (`taco-eo[ml]`, built from source; see `pyproject.toml`). That reader is
-proposed upstream to [asterisk-labs/taco](https://github.com/asterisk-labs/taco), and
-the dependency will point there once it is merged.
+TACO fork (`taco-eo[ml]` from `OscarPellicer/taco`, `main`). That reader is proposed
+upstream to [asterisk-labs/taco](https://github.com/asterisk-labs/taco), and the
+dependency will point there once it is merged.
+
+pip builds the fork from source, which needs:
+
+- **CMake** (3.21 or later) and **Ninja**, on `PATH`;
+- **a C++20 compiler**, such as GCC 11+ or Clang 14+. Point `CC` and `CXX` at it if
+  the system default is older:
+
+```bash
+CC=/path/to/gcc CXX=/path/to/g++ pip install -e ".[torch,test]"
+```
 
 ## Quick start
 
@@ -218,7 +310,7 @@ Changes in coverage:
 
 ```bash
 pytest                                              # data tests skip without data
-ELLIOT_ROOT=... ELLIOT_X_EXT_ROOT=... pytest        # all 43
+ELLIOT_ROOT=... ELLIOT_X_EXT_ROOT=... pytest        # all 45
 ```
 
 - Without data, the tests check the scorers and the registry.
@@ -228,7 +320,8 @@ ELLIOT_ROOT=... ELLIOT_X_EXT_ROOT=... pytest        # all 43
   - They exercise the PyTorch dataset.
   - They build a six-tile subset as TACO zip parts with a `.tacocat/` and check that
     the zip layout, a stubbed Hugging Face download (which fetches only the zip part
-    it needs) and a metadata overlay all give identical results.
+    it needs), a metadata overlay and a zip overlay used by default for a release
+    without `ml:contract` all give identical results.
 
 ## Licence and credits
 
