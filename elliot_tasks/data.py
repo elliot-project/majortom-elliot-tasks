@@ -417,31 +417,62 @@ class Part:
 
         These two GeoParquet leaves are structure leaves of the extension, not slots
         of its ML contract, so they are located through the generic reader.
+        The wide table is joined to the sample table on (partition, sample id), not
+        by position: taco 0.14 returns the rows of a multi-partition catalog in no
+        particular order. The sample id is the row's own `internal:current_id`,
+        which is what the wide table's index carries in every layout (numbered per
+        partition by older writers, across partitions by taco 0.14). The cell codes
+        are checked after the join.
         """
         t = self.ext.reader.read(files=['osm.parquet', 'admin.parquet'])
-        if t.column('majortom:code_10km').to_pylist() != \
-                self.ext.table.column('majortom:code_10km').to_pylist():
-            raise ValueError(f'{self.name}: leaf locations are not in sample order')
-        return {name: t.column(f'{name}::location').to_pylist()
-                for name in ('osm.parquet', 'admin.parquet')}
+        idx = next(c for c in ('taco:sample_index', 'sample_id') if c in t.column_names)
+        src = t.column('source_file').to_pylist() if 'source_file' in t.column_names \
+            else [None] * t.num_rows
+        where = {(f, int(i)): k for k, (f, i) in enumerate(zip(src, t.column(idx).to_pylist()))}
+        table = self.ext.table
+        own = table.column('internal:source_file').to_pylist() \
+            if 'internal:source_file' in table.column_names and src[0] is not None \
+            else [None] * table.num_rows
+        ids = [int(i) for i in table.column('internal:current_id').to_pylist()]
+        order = [where[key] for key in zip(own, ids)]
+        codes = t.column('majortom:code_10km').to_pylist()
+        if [codes[k] for k in order] != table.column('majortom:code_10km').to_pylist():
+            raise ValueError(f'{self.name}: leaf locations do not match the samples')
+        out = {}
+        for name in ('osm.parquet', 'admin.parquet'):
+            locs = t.column(f'{name}::location').to_pylist()
+            out[name] = [locs[k] for k in order]
+        return out
 
     def vector_location(self, name: str, index: int) -> str | None:
         return self._vector_locations[name][index]
 
     def payload_paths(self, side: str, index: int) -> list[str]:
-        """Every payload path of one sample below `DATA/`, from the metadata."""
+        """Every payload path of one sample, relative to its container, from the metadata.
+
+        Paths start with the sample's own relative path, which is its row number in a
+        FOLDER container and its id within its partition in a TACOCAT; there the rows
+        are also matched on the partition.
+        """
         import pyarrow.compute as pc
         ds = self.elliot if side == 'elliot' else self.ext
+        table = ds.table
+        prefix = str(table.column('internal:relative_path')[index].as_py()).split('/')[0] + '/'
+        source = (table.column('internal:source_file')[index].as_py()
+                  if 'internal:source_file' in table.column_names else None)
         out = []
         for level in ds.reader.contract.levels:
             if level == 'sample':
                 continue
-            col = ds.level(level).column('internal:relative_path')
-            hit = col.filter(pc.starts_with(col, f'{index}/'))
+            t = ds.level(level)
+            keep = pc.starts_with(t.column('internal:relative_path'), prefix)
+            if source is not None and 'internal:source_file' in t.column_names:
+                keep = pc.and_(keep, pc.equal(t.column('internal:source_file'), source))
+            hit = t.column('internal:relative_path').filter(keep)
             out += [p for p in hit.to_pylist() if p and '.' in p.rsplit('/', 1)[-1]]
         # Files at the top of a sample (the extension's GeoParquet leaves) are in the
         # declared structure even where no metadata row lists them.
-        out += [f'{index}/{leaf}' for leaf in ds.collection.get('taco:structure', [])
+        out += [f'{prefix}{leaf}' for leaf in ds.collection.get('taco:structure', [])
                 if '/' not in leaf]
         return sorted(set(out))
 
