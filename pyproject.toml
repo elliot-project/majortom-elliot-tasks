@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "majortom-elliot-tasks"
+version = "0.1.0"
+description = "Measured fact sheets, vision-language tasks and scorers over Major TOM ELLIOT-Pretrain and ELLIOT-X-EXT, read through TACO."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+authors = [
+    { name = "Image and Signal Processing Group (ISP), Universitat de València" },
+]
+keywords = ["earth-observation", "remote-sensing", "vision-language", "major-tom", "elliot", "taco"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: GIS",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "pyarrow>=14",
+    "shapely>=2",
+    # The `taco.ml` reader (ML contract, FOLDER and TACOCAT reading) is in the TACO
+    # fork while it is proposed upstream; it builds from source (CMake, a C++ compiler).
+    "taco-eo[ml] @ git+https://github.com/OscarPellicer/taco.git@main#subdirectory=python",
+]
+
+[project.optional-dependencies]
+torch = ["torch>=2.2"]
+hf = ["huggingface_hub>=0.24"]
+examples = ["matplotlib>=3.7", "jupyter"]
+test = ["pytest>=8", "huggingface_hub>=0.24", "torch>=2.2"]
+
+[project.urls]
+Data = "https://source.coop/major-tom/elliot-pretrain"
+Extension = "https://huggingface.co/datasets/isp-uv-es/elliot-x-ext"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["elliot_tasks"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
+filterwarnings = ["ignore::RuntimeWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# Compact one-line guards and lambdas are kept from the ported code; a family that
+# fails on an odd tile is skipped rather than failing the sample, on purpose.
+ignore = ["E701", "E731", "E741", "C408", "ISC004", "RUF046", "BLE001", "S112", "B023"]
