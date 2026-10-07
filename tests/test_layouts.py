@@ -29,17 +29,29 @@ def _signature(et, tile):
             [(e.family, e.question, e.target) for e in et.examples_for(tile)])
 
 
+def _export(source, output, first: int, stop: int) -> None:
+    """Copy samples [first, stop) with the TACO writer, in either export API: a SQL
+    selection (taco 0.14 and later) or a table of sample ids (earlier)."""
+    import inspect
+
+    import taco
+    if 'sql' in inspect.signature(taco.export).parameters:
+        taco.export(source, output, sql=f'SELECT * FROM sample WHERE "taco:sample_index" '
+                                        f'>= {first} AND "taco:sample_index" < {stop}')
+    else:
+        import pyarrow as pa
+        taco.export(source, output, samples=pa.table({'sample_id': list(range(first, stop))}))
+
+
 @pytest.fixture(scope='module')
 def subset(tmp_path_factory):
-    import pyarrow as pa
+    pytest.importorskip('cozip')                 # the TACO writer's zip backend
     import taco
     root = tmp_path_factory.mktemp('layouts')
     e_root, x_root = os.environ['ELLIOT_ROOT'], os.environ['ELLIOT_X_EXT_ROOT']
-    taco.export(f'{e_root}/burst', root / 'e' / 'burst',
-                samples=pa.table({'sample_id': list(range(N))}))
+    _export(f'{e_root}/burst', root / 'e' / 'burst', 0, N)
     for k, (a, b) in enumerate([(0, N // 2), (N // 2, N)]):
-        taco.export(f'{x_root}/burst', root / 'x' / 'burst' / f'elliot-x-ext-burst.{k:04d}.zip',
-                    samples=pa.table({'sample_id': list(range(a, b))}))
+        _export(f'{x_root}/burst', root / 'x' / 'burst' / f'elliot-x-ext-burst.{k:04d}.zip', a, b)
     taco.consolidate(sorted((root / 'x' / 'burst').glob('*.zip')))
     return root
 
@@ -60,7 +72,7 @@ def test_tacocat_zip_parts(subset, reference):
 
 
 def test_hugging_face_fetches_one_zip_part(subset, reference, tmp_path, monkeypatch):
-    import huggingface_hub
+    huggingface_hub = pytest.importorskip('huggingface_hub')
 
     import elliot_tasks as et
     calls = []
@@ -92,3 +104,48 @@ def test_metadata_overlay(subset, reference, tmp_path):
                  elliot_metadata=str(subset / 'e'), cache_dir=str(tmp_path))
     assert _signature(et, et.tile('burst', 1)) == reference[1]
     assert any(p.is_symlink() for p in tmp_path.rglob('DATA'))
+
+
+def _as_published(subset, tmp_path):
+    """The subset as the ELLIOT-Pretrain release is published: no ml:contract."""
+    import json
+    rel = tmp_path / 'release' / 'burst'
+    rel.mkdir(parents=True)
+    coll = json.loads((subset / 'e' / 'burst' / 'COLLECTION.json').read_text())
+    coll.pop('ml:contract')
+    (rel / 'COLLECTION.json').write_text(json.dumps(coll))
+    for name in ('DATA', 'METADATA'):
+        (rel / name).symlink_to(subset / 'e' / 'burst' / name)
+    return tmp_path / 'release'
+
+
+def _overlay_zip(subset, path):
+    import zipfile
+    src = subset / 'e' / 'burst'
+    with zipfile.ZipFile(path, 'w') as z:
+        z.write(src / 'COLLECTION.json', 'burst/COLLECTION.json')
+        for f in sorted((src / 'METADATA').glob('*.parquet')):
+            z.write(f, f'burst/METADATA/{f.name}')
+    return path
+
+
+def test_release_without_contract_uses_the_default_zip_overlay(subset, reference, tmp_path,
+                                                               monkeypatch):
+    import elliot_tasks as et
+    from elliot_tasks import data
+    monkeypatch.setattr(data, 'ELLIOT_METADATA_OVERLAY',
+                        str(_overlay_zip(subset, tmp_path / 'overlay.zip')))
+    et.configure(elliot=str(_as_published(subset, tmp_path)), ext=str(subset / 'x'),
+                 cache_dir=str(tmp_path / 'cache'))
+    with pytest.warns(UserWarning, match='no ml:contract'):
+        assert _signature(et, et.tile('burst', 1)) == reference[1]
+
+
+def test_release_without_contract_and_no_overlay_says_why(subset, tmp_path, monkeypatch):
+    import elliot_tasks as et
+    from elliot_tasks import data
+    monkeypatch.setattr(data, 'ELLIOT_METADATA_OVERLAY', None)
+    et.configure(elliot=str(_as_published(subset, tmp_path)), ext=str(subset / 'x'),
+                 cache_dir=str(tmp_path / 'cache'))
+    with pytest.raises(ValueError, match='metadata overlay'):
+        et.open_part('burst')

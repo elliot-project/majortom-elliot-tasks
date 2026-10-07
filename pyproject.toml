@@ -28,6 +28,8 @@ dependencies = [
     "pandas>=2.1",
     "pyarrow>=14",
     "shapely>=2",
+    # Remote roots, and the corrected ELLIOT-Pretrain metadata used by default.
+    "huggingface_hub>=0.24",
     # The `taco.ml` reader (ML contract, FOLDER and TACOCAT reading) is in the TACO
     # fork while it is proposed upstream; it builds from source (CMake, a C++ compiler).
     "taco-eo[ml] @ git+https://github.com/OscarPellicer/taco.git@main#subdirectory=python",
@@ -35,9 +37,9 @@ dependencies = [
 
 [project.optional-dependencies]
 torch = ["torch>=2.2"]
-hf = ["huggingface_hub>=0.24"]
 examples = ["matplotlib>=3.7", "jupyter"]
-test = ["pytest>=8", "huggingface_hub>=0.24", "torch>=2.2"]
+# cozip is the TACO writer's zip backend, which the layout tests use.
+test = ["pytest>=8", "torch>=2.2", "cozip"]
 
 [project.urls]
 Data = "https://source.coop/major-tom/elliot-pretrain"

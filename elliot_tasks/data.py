@@ -19,10 +19,11 @@ part is opened, and only the files (FOLDER) or the one zip part (TACOCAT) holdin
 sample when that sample is read. Nothing close to the multi-TB whole is fetched for
 a handful of tiles.
 
-A root can also take a METADATA OVERLAY: a directory (or hf:// spec) holding
-`<part>/COLLECTION.json` and `<part>/METADATA/` that replace the root's own. This is
-how ELLIOT-Pretrain's corrected, contract-bearing metadata is used over pixels read
-from elsewhere; see the README.
+A root can also take a METADATA OVERLAY: a directory or a zip file (local, or
+`hf://<org>/<repo>/<path>`) holding `<part>/COLLECTION.json` and `<part>/METADATA/`
+that replace the root's own. This is how ELLIOT-Pretrain's corrected,
+contract-bearing metadata is used over pixels read from its release; when a release
+has no `ml:contract`, `ELLIOT_METADATA_OVERLAY` is used automatically. See the README.
 
 Roots come from `configure(...)`, or else from the environment variables
 `ELLIOT_ROOT`, `ELLIOT_X_EXT_ROOT` and, optionally, `ELLIOT_METADATA`.
@@ -36,6 +37,8 @@ import json
 import os
 import shutil
 import urllib.request
+import warnings
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -88,6 +91,13 @@ def _fetch(url: str, dest: Path) -> None:
     tmp.replace(dest)
 
 
+def _ready(folder: Path) -> bool:
+    """Is a part's metadata complete on disk: a catalog, or COLLECTION.json + METADATA?"""
+    return (folder / CATALOG / 'sample.parquet').is_file() or (
+        (folder / 'COLLECTION.json').is_file()
+        and (folder / 'METADATA' / 'sample.parquet').is_file())
+
+
 @functools.lru_cache(maxsize=16)
 def _partitions(catalog: str) -> list[str]:
     """The zip part holding each row of a TACOCAT, in row order."""
@@ -96,12 +106,34 @@ def _partitions(catalog: str) -> list[str]:
     return t.column('internal:source_file').to_pylist()
 
 
+#: The corrected ELLIOT-Pretrain metadata, published beside ELLIOT-X-EXT. It is used
+#: automatically when an ELLIOT-Pretrain root's own COLLECTION.json has no
+#: `ml:contract`, which is the case for the current Source Cooperative release.
+ELLIOT_METADATA_OVERLAY = 'hf://isp-uv-es/elliot-x-ext/elliot-pretrain-metadata-overlay.zip'
+
+
+def _split_hf(spec: str) -> tuple[str, str]:
+    """`hf://<org>/<repo>[/<path>]` -> (`<org>/<repo>`, `<path>`)."""
+    bits = spec.removeprefix('hf://').strip('/').split('/')
+    if len(bits) < 2:
+        raise ValueError(f'{spec!r}: expected hf://<org>/<repo>[/<path>]')
+    return '/'.join(bits[:2]), '/'.join(bits[2:])
+
+
+_PART_DIRS: dict = {}
+
+
 @dataclass(frozen=True)
 class Source:
-    """One dataset root (see the module docstring), with an optional metadata overlay."""
+    """One dataset root (see the module docstring), with an optional metadata overlay.
+
+    `metadata` is an overlay chosen by the caller. `default_metadata` is used only
+    when the root's own metadata has no `ml:contract`, and says so when it is.
+    """
     spec: str
     cache_dir: str | None = None
     metadata: str | None = None
+    default_metadata: str | None = None
 
     @property
     def kind(self) -> str:
@@ -113,65 +145,128 @@ class Source:
 
     # -- where things go --------------------------------------------------------
     def _hf(self) -> tuple[str, str]:
-        bits = self.spec.removeprefix('hf://').strip('/').split('/')
-        if len(bits) < 2:
-            raise ValueError(f'{self.spec!r}: expected hf://<org>/<repo>[/<subdir>]')
-        sub = '/'.join(bits[2:])
-        return '/'.join(bits[:2]), (sub + '/' if sub else '')
+        repo, sub = _split_hf(self.spec)
+        return repo, (sub + '/' if sub else '')
 
-    def _mirror(self) -> Path:
+    def _hf_local(self, repo: str) -> Path:
+        return _cache_base(self.cache_dir) / 'hf' / repo.replace('/', '__')
+
+    def _mirror(self, overlay: str | None) -> Path:
         """Local folder holding the parts: the root itself, or its cache mirror."""
-        if self.kind == 'local' and not self.metadata:
+        if self.kind == 'local' and not overlay:
             return Path(self.spec)
-        slug = hashlib.sha1(f'{self.spec}|{self.metadata}'.encode()).hexdigest()[:10]
+        slug = hashlib.sha1(f'{self.spec}|{overlay}'.encode()).hexdigest()[:10]
         name = self.spec.rstrip('/').split('/')[-1] or 'root'
         return _cache_base(self.cache_dir) / f'{name}-{slug}'
 
     def _hf_download(self, spec: str, patterns: list[str]) -> Path:
         from huggingface_hub import snapshot_download
-        bits = spec.removeprefix('hf://').strip('/').split('/')
-        repo = '/'.join(bits[:2])
-        local = _cache_base(self.cache_dir) / 'hf' / repo.replace('/', '__')
+        repo, _ = _split_hf(spec)
+        local = self._hf_local(repo)
         snapshot_download(repo_id=repo, repo_type='dataset', allow_patterns=patterns,
                           local_dir=str(local))
         return local
 
     # -- metadata -------------------------------------------------------------
-    def _overlay(self, part: str, folder: Path) -> None:
-        """Put the overlay's COLLECTION.json and METADATA/ into `folder`."""
-        src = self.metadata
+    def _release_collection(self, part: str) -> dict | None:
+        """The root's own COLLECTION.json for one part, or None if it has none."""
+        if self.kind == 'local':
+            for f in (Path(self.spec) / part / 'COLLECTION.json',
+                      Path(self.spec) / part / CATALOG / 'COLLECTION.json'):
+                if f.is_file():
+                    return json.loads(f.read_text())
+            return None
+        if self.kind == 'hf':
+            _, sub = self._hf()
+            local = self._hf_download(self.spec, [f'{sub}{part}/COLLECTION.json',
+                                                  f'{sub}{part}/{CATALOG}/COLLECTION.json'])
+            for f in (local / sub / part / 'COLLECTION.json',
+                      local / sub / part / CATALOG / 'COLLECTION.json'):
+                if f.is_file():
+                    return json.loads(f.read_text())
+            return None
+        dest = self._mirror(None) / '_release' / part / 'COLLECTION.json'
+        if not dest.is_file():
+            _fetch(f'{self.spec.rstrip("/")}/{part}/COLLECTION.json', dest)
+        return json.loads(dest.read_text())
+
+    def overlay_for(self, part: str) -> str | None:
+        """The metadata overlay this part is read with, if any."""
+        if self.metadata:
+            return self.metadata
+        if not self.default_metadata:
+            return None
+        coll = self._release_collection(part)
+        if coll is None or 'ml:contract' in coll:
+            return None
+        warnings.warn(
+            f'{self.spec} ({part}): this release of Major TOM ELLIOT-Pretrain has no '
+            f'ml:contract and carries the old frame metadata, so its corrected metadata '
+            f'is used instead, from {self.default_metadata}. Pixels are still read from '
+            f'{self.spec}. Pass elliot_metadata=... to use another overlay.',
+            stacklevel=4)
+        return self.default_metadata
+
+    def _overlay(self, part: str, folder: Path, src: str) -> None:
+        """Put an overlay's `<part>/COLLECTION.json` and `<part>/METADATA/` into `folder`.
+
+        The overlay is a directory or a zip file holding those, locally or as
+        `hf://<org>/<repo>/<path>`.
+        """
+        if src.endswith('.zip'):
+            if src.startswith('hf://'):
+                from huggingface_hub import hf_hub_download
+                repo, path = _split_hf(src)
+                src = hf_hub_download(repo_id=repo, repo_type='dataset', filename=path,
+                                      local_dir=str(self._hf_local(repo)))
+            with zipfile.ZipFile(src) as z:
+                names = [n for n in z.namelist() if n.startswith(f'{part}/')
+                         and not n.endswith('/')]
+                if f'{part}/COLLECTION.json' not in names:
+                    raise FileNotFoundError(f'metadata overlay {src}: no {part}/COLLECTION.json')
+                for n in names:
+                    dest = folder / n.removeprefix(f'{part}/')
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    with z.open(n) as r, open(dest, 'wb') as w:
+                        shutil.copyfileobj(r, w)
+            return
         if src.startswith('hf://'):
-            bits = src.removeprefix('hf://').strip('/').split('/')
-            sub = '/'.join(bits[2:])
+            _, sub = _split_hf(src)
             sub = sub + '/' if sub else ''
-            base = self._hf_download(src, [f'{sub}{part}/COLLECTION.json',
-                                           f'{sub}{part}/METADATA/*'])
-            meta = base / sub / part
+            meta = self._hf_download(src, [f'{sub}{part}/COLLECTION.json',
+                                           f'{sub}{part}/METADATA/*']) / sub / part
         else:
             meta = Path(src) / part
         if not (meta / 'COLLECTION.json').is_file():
             raise FileNotFoundError(f'metadata overlay {src}: no {part}/COLLECTION.json')
         folder.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(meta / 'COLLECTION.json', folder / 'COLLECTION.json')
         shutil.copytree(meta / 'METADATA', folder / 'METADATA', dirs_exist_ok=True)
+        shutil.copy2(meta / 'COLLECTION.json', folder / 'COLLECTION.json')
 
     def part_dir(self, part: str) -> Path:
-        """The local folder of one part, with its metadata present."""
+        """The local folder of one part, with its metadata present. Resolved once
+        per process, so the overlay check (and its warning) happens once."""
+        key = (self, part)
+        if key not in _PART_DIRS:
+            _PART_DIRS[key] = self._part_dir(part)
+        return _PART_DIRS[key]
+
+    def _part_dir(self, part: str) -> Path:
+        overlay = self.overlay_for(part)
+        if overlay:
+            folder = self._mirror(overlay) / part
+            if not _ready(folder):
+                self._overlay(part, folder, overlay)
+            if self.kind == 'local' and not (folder / 'DATA').exists():
+                # Pixels stay where they are.
+                (folder / 'DATA').symlink_to((Path(self.spec) / part / 'DATA').resolve())
+            return folder
         if self.kind == 'hf':
             repo, sub = self._hf()
-            folder = _cache_base(self.cache_dir) / 'hf' / repo.replace('/', '__') / sub / part
+            folder = self._hf_local(repo) / sub / part
         else:
-            folder = self._mirror() / part
-        ready = (folder / 'COLLECTION.json').is_file() or \
-            (folder / CATALOG / 'COLLECTION.json').is_file()
-        if ready:
-            return folder
-        if self.metadata:
-            self._overlay(part, folder)
-            if self.kind == 'local':                  # pixels stay where they are
-                data = Path(self.spec) / part / 'DATA'
-                if not (folder / 'DATA').exists():
-                    (folder / 'DATA').symlink_to(data.resolve())
+            folder = self._mirror(None) / part
+        if self.kind == 'local' or _ready(folder):
             return folder
         if self.kind == 'hf':
             repo, sub = self._hf()
@@ -180,13 +275,13 @@ class Source:
                                           f'{sub}{part}/METADATA/*'])
         elif self.kind == 'http':
             base = self.spec.rstrip('/') + f'/{part}'
-            _fetch(f'{base}/COLLECTION.json', folder / 'COLLECTION.json')
-            coll = json.loads((folder / 'COLLECTION.json').read_text())
+            coll = self._release_collection(part)
             if 'ml:contract' not in coll:
-                (folder / 'COLLECTION.json').unlink()
                 raise ValueError(_NO_CONTRACT.format(what=self.spec, where=base))
             for name in _metadata_files(coll):
                 _fetch(f'{base}/METADATA/{name}', folder / 'METADATA' / name)
+            shutil.copy2(self._mirror(None) / '_release' / part / 'COLLECTION.json',
+                         folder / 'COLLECTION.json')
         return folder
 
     def ensure_sample(self, part: str, index: int, paths: list[str]) -> None:
@@ -227,8 +322,10 @@ def configure(elliot: str | None = None, ext: str | None = None, *,
               cache_dir: str | None = None) -> Roots:
     """Set the two dataset roots for this process. Returns them.
 
-    `elliot_metadata` is an optional overlay for ELLIOT-Pretrain (see the module
-    docstring); it defaults to the `ELLIOT_METADATA` environment variable.
+    `elliot_metadata` is a metadata overlay for ELLIOT-Pretrain (see the module
+    docstring), defaulting to the `ELLIOT_METADATA` environment variable. Without
+    one, a release whose metadata has no `ml:contract` -- the current Source
+    Cooperative release -- is read with `ELLIOT_METADATA_OVERLAY`, with a warning.
     """
     global _ROOTS
     elliot = elliot or os.environ.get('ELLIOT_ROOT')
@@ -237,7 +334,7 @@ def configure(elliot: str | None = None, ext: str | None = None, *,
     if not elliot or not ext:
         raise RuntimeError('set both roots: elliot_tasks.configure(elliot=..., ext=...) '
                            'or the ELLIOT_ROOT and ELLIOT_X_EXT_ROOT variables')
-    _ROOTS = Roots(Source(str(elliot), cache_dir, elliot_metadata),
+    _ROOTS = Roots(Source(str(elliot), cache_dir, elliot_metadata, ELLIOT_METADATA_OVERLAY),
                    Source(str(ext), cache_dir))
     _open.cache_clear()
     return _ROOTS
