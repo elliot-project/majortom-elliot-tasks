@@ -6,11 +6,10 @@ curriculum can change without re-deriving 279,166 tiles, the model cannot memori
 one frozen string per tile because the wording is resampled, and boxes, grids and
 captions come out of one code path instead of three artifacts that drift.
 
-A free-text caption is the ONE exception: it is a single stored string that one
-family (`caption`) reads, supplied by the caller. What an LLM adds over a template
-is salience -- choosing which three of thirty facts matter here -- and world
-knowledge. That is worth freezing into a column. It is not worth making it the
-dataset.
+Captions are built the same way, by the rule-based captioner in `caption.py`, with a
+fresh wording per epoch and only the paragraphs the sample's input modalities license.
+A caller with its own captions (from an LLM, say) can pass them instead, and the
+`caption` family then reads that stored string.
 
 The design carries over lessons from an earlier task suite ("prior suite" below):
 the unified integer-grid schema, the paraphrase banks, the train/eval split BY
@@ -40,6 +39,7 @@ from typing import Any
 
 import numpy as np
 
+from . import caption as capt
 from . import factsheet as fsheet
 from . import temporal as tmp
 from .data import Tile
@@ -449,6 +449,9 @@ class TileFacts:
     cell: str
     sheet: fsheet.FactSheet
     caption: str | None = None       # a stored caption, when the caller has one
+    #: The encoder's input modalities for this draw, set by `examples_for`; the
+    #: template caption keeps only the paragraphs they license.
+    inputs: set[str] | None = None
     series: tmp.SeriesFacts | None = None
     tile: Tile | None = None
     #: Which prompt templates to draw from: 'train', 'eval' or 'all'.
@@ -516,11 +519,13 @@ def _ask(family: str, rng: random.Random, partition: str, shape: Shape,
 # --------------------------------------------------------------------------------
 @register('caption', Shape.PROSE, (), chain_stage=3)
 def _caption(t: TileFacts, rng: random.Random) -> Example | None:
-    """The one family that reads the stored LLM narrative rather than deriving it."""
-    if not t.caption:
-        return None
-    return Example('caption', _ask('caption', rng, t.partition, Shape.PROSE),
-                   t.caption, Shape.PROSE)
+    """The caller's stored caption if there is one, else the rule-based caption
+    (`caption.py`), reworded each epoch and cut to the paragraphs the input licenses."""
+    q = _ask('caption', rng, t.partition, Shape.PROSE)
+    if t.caption:
+        return Example('caption', q, t.caption, Shape.PROSE)
+    text = capt.caption(t.sheet, seed=rng.randrange(2 ** 32), available=t.inputs)
+    return Example('caption', q, text, Shape.PROSE) if text else None
 
 
 @register('dominant_cover', Shape.WORD, ('lc',), chain_stage=3)
@@ -943,6 +948,7 @@ def examples_for(tile: Tile | str | None = None, *, available: set[str] | None =
     if caption and not t.caption:
         t.caption = caption
     av = set(available) if available is not None else set(t.available)
+    t.inputs = av & set(t.sheet.available)
     from .shapes import FEASIBILITY_RANK
     cap = FEASIBILITY_RANK[max_feasibility] if max_feasibility else 99
 
