@@ -20,6 +20,7 @@ from .data import (
                    tile,
 )
 from .factsheet import SEGMENTS, FactSheet, assemble, build_user_prompt, fact_sheet
+from .factstore import configure_facts, facts
 from .scoring import Score, score, score_conversation
 from .shapes import SHAPES, Feasibility, Shape
 from .tasks import (
@@ -60,8 +61,10 @@ __all__ = [
                    'caption_check',
                    'chain_order',
                    'configure',
+                   'configure_facts',
                    'examples_for',
                    'fact_sheet',
+                   'facts',
                    'find',
                    'open_part',
                    'pack_conversation',

@@ -311,7 +311,8 @@ class Source:
 @dataclass(frozen=True)
 class Roots:
     elliot: Source
-    ext: Source
+    #: None for the merged release, where one dataset holds both.
+    ext: Source | None = None
 
 
 _ROOTS: Roots | None = None
@@ -320,7 +321,11 @@ _ROOTS: Roots | None = None
 def configure(elliot: str | None = None, ext: str | None = None, *,
               elliot_metadata: str | None = None,
               cache_dir: str | None = None) -> Roots:
-    """Set the two dataset roots for this process. Returns them.
+    """Set the dataset roots for this process. Returns them.
+
+    `elliot` alone is the merged release (ELLIOT-Pretrain with the extension's layers
+    in each sample, as on Source Cooperative). `elliot` and `ext` together are the
+    two separate datasets.
 
     `elliot_metadata` is a metadata overlay for ELLIOT-Pretrain (see the module
     docstring), defaulting to the `ELLIOT_METADATA` environment variable. Without
@@ -331,11 +336,11 @@ def configure(elliot: str | None = None, ext: str | None = None, *,
     elliot = elliot or os.environ.get('ELLIOT_ROOT')
     ext = ext or os.environ.get('ELLIOT_X_EXT_ROOT')
     elliot_metadata = elliot_metadata or os.environ.get('ELLIOT_METADATA') or None
-    if not elliot or not ext:
-        raise RuntimeError('set both roots: elliot_tasks.configure(elliot=..., ext=...) '
-                           'or the ELLIOT_ROOT and ELLIOT_X_EXT_ROOT variables')
+    if not elliot:
+        raise RuntimeError('set the root: elliot_tasks.configure(elliot=...) or the '
+                           'ELLIOT_ROOT variable')
     _ROOTS = Roots(Source(str(elliot), cache_dir, elliot_metadata, ELLIOT_METADATA_OVERLAY),
-                   Source(str(ext), cache_dir))
+                   Source(str(ext), cache_dir) if ext else None)
     _open.cache_clear()
     return _ROOTS
 
@@ -382,7 +387,14 @@ class Part:
             raise ValueError(f'part must be one of {PARTS}, got {name!r}')
         self.name, self.roots = name, r
         self.elliot = _open_dataset(r.elliot.part_dir(name), 'ELLIOT-Pretrain')
-        self.ext = _open_dataset(r.ext.part_dir(name), 'ELLIOT-X-EXT')
+        self.merged = r.ext is None
+        if self.merged:
+            self.ext = self.elliot
+            if not any(s.name == 's1' for s in self.elliot.contract.inputs):
+                raise ValueError(f'{name}: this ELLIOT-Pretrain has no extension layers; '
+                                 'pass the extension root too (configure(ext=...))')
+        else:
+            self.ext = _open_dataset(r.ext.part_dir(name), 'ELLIOT-X-EXT')
         if len(self.elliot) != len(self.ext):
             raise ValueError(f'{name}: {len(self.elliot)} ELLIOT samples against '
                              f'{len(self.ext)} in the extension; they must be row-aligned')
@@ -551,7 +563,7 @@ class Tile:
         if r.elliot.kind != 'local':
             r.elliot.ensure_sample(self.part.name, self.index,
                                    self.part.payload_paths('elliot', self.index))
-        if r.ext.kind != 'local':
+        if r.ext is not None and r.ext.kind != 'local':
             r.ext.ensure_sample(self.part.name, self.index,
                                 self.part.payload_paths('ext', self.index))
 
@@ -584,12 +596,32 @@ class Tile:
 
     @functools.cached_property
     def s2_ext_frames(self) -> list[dict]:
-        """X-EXT's per-acquisition S2 rows: cloud fractions and ERA5 at overpass."""
-        return _frame_rows(self.part.ext, self.index, 'children/s2', EXT_FRAME_COLUMNS)
+        """Per-acquisition S2 cloud fractions and ERA5 at overpass."""
+        return self._ext_frames('s2')
 
     @functools.cached_property
     def l8_ext_frames(self) -> list[dict]:
-        return _frame_rows(self.part.ext, self.index, 'children/l8', EXT_FRAME_COLUMNS)
+        return self._ext_frames('l8')
+
+    def _ext_frames(self, sensor: str) -> list[dict]:
+        if not self.part.merged:
+            return _frame_rows(self.part.ext, self.index, f'children/{sensor}', EXT_FRAME_COLUMNS)
+        # Merged release: ERA5 is on the acquisition rows, the fractions on the mask
+        # rows; both are in frame order and pair by position.
+        ds = self.part.elliot
+        frames = _frame_rows(ds, self.index, f'children/{sensor}',
+                             [f'{sensor}:date'] + [c for c in EXT_FRAME_COLUMNS
+                                                   if c.startswith('ml:era5')])
+        masks = _frame_rows(ds, self.index, f'children/cloud_{sensor}', EXT_FRAME_COLUMNS)
+        out = []
+        for k, f in enumerate(frames):
+            row = {'path': f['path'], 'ml:acquisition_index': k,
+                   'ml:date': str(f.get(f'{sensor}:date') or '')[:10] or None}
+            row.update({c: v for c, v in f.items() if c.startswith('ml:era5')})
+            if k < len(masks):
+                row.update({c: v for c, v in masks[k].items() if c != 'path'})
+            out.append(row)
+        return out
 
     @functools.cached_property
     def s1_frames(self) -> list[dict]:

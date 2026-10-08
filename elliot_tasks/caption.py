@@ -825,7 +825,7 @@ if __name__ == '__main__':
     import sys
 
     from .data import configure
-    configure()                          # roots from ELLIOT_ROOT and ELLIOT_X_EXT_ROOT
+    configure()                          # roots from ELLIOT_ROOT (and ELLIOT_X_EXT_ROOT)
     for cell in sys.argv[1:] or ['284D_496L']:
         f = ef.fact_sheet(cell)
         for s in (0, 1):

@@ -452,6 +452,9 @@ class TileFacts:
     #: The encoder's input modalities for this draw, set by `examples_for`; the
     #: template caption keeps only the paragraphs they license.
     inputs: set[str] | None = None
+    #: Grids precomputed for every side (`facts.py`): {'ndvi'|'cover': {side: grid}
+    #: or None}. When absent, the grid families compute them from `tile`.
+    grids: dict | None = None
     series: tmp.SeriesFacts | None = None
     tile: Tile | None = None
     #: Which prompt templates to draw from: 'train', 'eval' or 'all'.
@@ -497,6 +500,11 @@ def tile_facts(tile: Tile | str, caption: str | None = None,
     so the fact sheet, the series and every family share one read.
     """
     tile = fsheet.as_tile(tile)
+    from . import factstore as F
+    if F.facts_root() and (rec := F.record(tile.part.name, tile.index)) is not None:
+        return TileFacts(cell=rec['cell'], sheet=rec['sheet'], caption=caption,
+                         series=rec['series'] if with_series else None, tile=tile,
+                         partition=partition, grids=rec['grids'])
     sf = None
     if with_series:
         try:
@@ -616,6 +624,73 @@ def _grid_side(rng: random.Random) -> int:
     return side
 
 
+def _ndvi_image(t: TileFacts) -> np.ndarray | None:
+    """Cloud-masked NDVI of frame 0, or None when too little of it is readable."""
+    raw = t.tile.frame('s2', 0) if t.tile is not None else None
+    if raw is None:
+        return None
+    cube = raw[[fsheet.S2['red'], fsheet.S2['nir']]].astype(np.float32) * t.tile.scale('s2')
+    red, nir = cube[0], cube[1]
+    ok = np.isfinite(red) & np.isfinite(nir) & (red > 0)
+    cmask = fsheet.clear_mask(t.tile, 0)
+    if cmask is not None and cmask.shape == ok.shape:
+        ok &= cmask
+    if ok.sum() < 1000:
+        return None
+    with np.errstate(invalid='ignore', divide='ignore'):
+        return np.where(ok & (np.abs(nir + red) > 1e-6), (nir - red) / (nir + red),
+                        np.nan)
+
+
+def _ndvi_cells(ndvi: np.ndarray, side: int) -> list[list]:
+    h, w = ndvi.shape
+    grid = []
+    for i in range(side):
+        row = []
+        for j in range(side):
+            blk = ndvi[i * h // side:(i + 1) * h // side,
+                       j * w // side:(j + 1) * w // side]
+            finite = np.isfinite(blk)
+            # A cell that is mostly cloud or nodata has no honest value. Same
+            # threshold as the categorical grids, and stated in the prompt.
+            row.append(int(round(100 * float(np.nanmean(blk))))
+                       if finite.mean() >= DEFAULT_CELL_THRESHOLD else GRID_UNKNOWN)
+        grid.append(row)
+    return grid
+
+
+def _cover_cells(lc: np.ndarray, side: int) -> list[list]:
+    legend = {c: i for i, c in enumerate(sorted(fsheet.WC))}
+    h, w = lc.shape
+    grid = []
+    for i in range(side):
+        row = []
+        for j in range(side):
+            blk = lc[i * h // side:(i + 1) * h // side,
+                     j * w // side:(j + 1) * w // side]
+            if blk.size == 0:
+                row.append(GRID_UNKNOWN)
+                continue
+            vals, counts = np.unique(blk, return_counts=True)
+            k = int(vals[counts.argmax()])
+            share = counts.max() / blk.size
+            row.append(legend[k] if (share >= DEFAULT_CELL_THRESHOLD
+                                     and k in legend) else GRID_UNKNOWN)
+        grid.append(row)
+    return grid
+
+
+def ndvi_grids(t: TileFacts, sides) -> dict[int, list[list]] | None:
+    """The NDVI grid at every side in `sides`, or None (what `facts.py` stores)."""
+    ndvi = _ndvi_image(t)
+    return None if ndvi is None else {s: _ndvi_cells(ndvi, s) for s in sides}
+
+
+def cover_grids(t: TileFacts, sides) -> dict[int, list[list]] | None:
+    lc = t.tile.read('lc') if t.tile is not None else None
+    return None if lc is None else {s: _cover_cells(lc, s) for s in sides}
+
+
 @register('ndvi_grid', Shape.GRID, ('s2',), chain_stage=1)
 def _ndvi_grid(t: TileFacts, rng: random.Random) -> Example | None:
     """NDVI x100 per cell, computed AT THE ASKED RESOLUTION.
@@ -630,35 +705,18 @@ def _ndvi_grid(t: TileFacts, rng: random.Random) -> Example | None:
     of cloud, and a cell that is mostly cloud reports null rather than a plausible
     number nobody can check.
     """
-    raw = t.tile.frame('s2', 0) if t.tile is not None else None
-    if raw is None:
-        return None
-    cube = raw[[fsheet.S2['red'], fsheet.S2['nir']]].astype(np.float32) * t.tile.scale('s2')
-    red, nir = cube[0], cube[1]
-    ok = np.isfinite(red) & np.isfinite(nir) & (red > 0)
-    cmask = fsheet.clear_mask(t.tile, 0)
-    if cmask is not None and cmask.shape == ok.shape:
-        ok &= cmask
-    if ok.sum() < 1000:
-        return None
-    with np.errstate(invalid='ignore', divide='ignore'):
-        ndvi = np.where(ok & (np.abs(nir + red) > 1e-6), (nir - red) / (nir + red),
-                        np.nan)
-
-    side = _grid_side(rng)
-    h, w = ndvi.shape
-    grid = []
-    for i in range(side):
-        row = []
-        for j in range(side):
-            blk = ndvi[i * h // side:(i + 1) * h // side,
-                       j * w // side:(j + 1) * w // side]
-            finite = np.isfinite(blk)
-            # A cell that is mostly cloud or nodata has no honest value. Same
-            # threshold as the categorical grids, and stated in the prompt.
-            row.append(int(round(100 * float(np.nanmean(blk))))
-                       if finite.mean() >= DEFAULT_CELL_THRESHOLD else GRID_UNKNOWN)
-        grid.append(row)
+    if t.grids is not None:
+        cached = t.grids['ndvi']
+        if cached is None:
+            return None
+        side = _grid_side(rng)
+        grid = cached[side]
+    else:
+        ndvi = _ndvi_image(t)
+        if ndvi is None:
+            return None
+        side = _grid_side(rng)
+        grid = _ndvi_cells(ndvi, side)
     if all(v is None for r in grid for v in r):
         return None
     q = _ask('ndvi_grid', rng, t.partition, Shape.GRID)
@@ -678,28 +736,20 @@ def _cover_grid(t: TileFacts, rng: random.Random) -> Example | None:
     that sentence the model is guessing which aggregation rule was used, and two
     reasonable readers of the same grid disagree.
     """
-    lc = t.tile.read('lc') if t.tile is not None else None
-    if lc is None:
-        return None
     classes = sorted(fsheet.WC)
     legend = {c: i for i, c in enumerate(classes)}
-    side = _grid_side(rng)
-    h, w = lc.shape
-    grid = []
-    for i in range(side):
-        row = []
-        for j in range(side):
-            blk = lc[i * h // side:(i + 1) * h // side,
-                     j * w // side:(j + 1) * w // side]
-            if blk.size == 0:
-                row.append(GRID_UNKNOWN)
-                continue
-            vals, counts = np.unique(blk, return_counts=True)
-            k = int(vals[counts.argmax()])
-            share = counts.max() / blk.size
-            row.append(legend[k] if (share >= DEFAULT_CELL_THRESHOLD
-                                     and k in legend) else GRID_UNKNOWN)
-        grid.append(row)
+    if t.grids is not None:
+        cached = t.grids['cover']
+        if cached is None:
+            return None
+        side = _grid_side(rng)
+        grid = cached[side]
+    else:
+        lc = t.tile.read('lc') if t.tile is not None else None
+        if lc is None:
+            return None
+        side = _grid_side(rng)
+        grid = _cover_cells(lc, side)
     q = _ask('cover_grid', rng, t.partition, Shape.GRID)
     q += (f' Use a {side} by {side} grid. Label a cell with a class only when that '
           f'class covers at least {DEFAULT_CELL_THRESHOLD:.0%} of the cell; '

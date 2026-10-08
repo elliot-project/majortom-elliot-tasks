@@ -1,5 +1,6 @@
 """The same tiles read from every supported layout give the same facts and tasks.
 
+These tests are of the two-dataset layout (ELLIOT_ROOT and ELLIOT_X_EXT_ROOT both set).
 Builds, from the real data, a six-sample burst subset of ELLIOT-Pretrain (FOLDER) and
 of ELLIOT-X-EXT as two TACO zip parts with a `.tacocat/` -- the layout of the
 Hugging Face release -- then reads it locally, through a stubbed Hugging Face
@@ -13,7 +14,8 @@ from pathlib import Path
 import pytest
 from conftest import needs_data
 
-pytestmark = needs_data
+pytestmark = [needs_data, pytest.mark.skipif(
+    not os.environ.get('ELLIOT_X_EXT_ROOT'), reason='the two-dataset layout needs ELLIOT_X_EXT_ROOT')]
 N = 6
 
 

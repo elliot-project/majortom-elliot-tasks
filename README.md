@@ -1,7 +1,6 @@
 # majortom-elliot-tasks
 
-Vision-language tasks over [Major TOM ELLIOT-Pretrain](https://source.coop/major-tom/elliot-pretrain)
-and its extension [ELLIOT-X-EXT](https://huggingface.co/datasets/isp-uv-es/elliot-x-ext).
+Vision-language tasks over [Major TOM ELLIOT-Pretrain](https://source.coop/major-tom/elliot-pretrain).
 
 For each 10.56 km tile the package measures a **fact sheet** (land cover, spectral
 indices, thermal, radar, terrain, cloud, weather, named OpenStreetMap features), and
@@ -9,21 +8,42 @@ from it generates **captions** and **16 task families** (grounding, grids, count
 phenology, change), with **scorers** and a **PyTorch dataset**. Tasks are built on the
 fly, with new wording every epoch, and only from the modalities the model is given.
 
+![A burst tile: Sentinel-2, cloud mask and Sentinel-1 over six acquisitions](docs/images/burst.jpg)
+
 ## Data
 
-| Dataset | Content | Link | Licence |
-|---|---|---|---|
-| ELLIOT-Pretrain | Sentinel-2 L1C, Landsat-8/9, Copernicus DEM, ESA WorldCover | [source.coop/major-tom/elliot-pretrain](https://source.coop/major-tom/elliot-pretrain) | CC-BY-SA-4.0 |
-| ELLIOT-X-EXT | cloud masks, ERA5, Sentinel-1 RTC, OpenStreetMap, admin units | [huggingface.co/datasets/isp-uv-es/elliot-x-ext](https://huggingface.co/datasets/isp-uv-es/elliot-x-ext) | CC-BY-SA-4.0; OSM layers ODbL-1.0 |
-| Metadata overlay | corrected metadata for ELLIOT-Pretrain | [elliot-pretrain-metadata-overlay.zip](https://huggingface.co/datasets/isp-uv-es/elliot-x-ext/blob/main/elliot-pretrain-metadata-overlay.zip) | CC-BY-SA-4.0 |
+Everything is in one place, [source.coop/major-tom/elliot-pretrain](https://source.coop/major-tom/elliot-pretrain):
 
-Both datasets have three parts, row-aligned (tile `i` is the same cell in both):
-`monotemporal` (250,000 tiles), `monthly` (12,500 tiles × 12 frames) and `burst`
-(16,666 tiles × 6 frames).
+| Part | Tiles | Acquisitions per tile |
+|---|---:|---|
+| `monotemporal` | 250,000 | 1 |
+| `monthly` | 12,500 | 12, one per calendar month, across years |
+| `burst` | 16,666 | 6, about five days apart |
 
-ELLIOT-Pretrain is read with the metadata overlay, which corrects its published
-metadata (the pixels are unchanged). The package downloads and applies the overlay
-automatically.
+Each tile holds, on one 10 m grid:
+
+| Layer | Source |
+|---|---|
+| Sentinel-2 L1C, 13 bands | ESA Copernicus |
+| Landsat 8/9, 11 bands | USGS |
+| Copernicus DEM | ESA / TanDEM-X |
+| ESA WorldCover | ESA |
+| Sentinel-1 RTC (VV, VH), one per Sentinel-2 frame | Catalyst, via Microsoft Planetary Computer |
+| cloud and shadow mask, one per Sentinel-2 and Landsat frame | OmniCloudMask |
+| ERA5 weather at each acquisition | Copernicus Climate Change Service |
+| OpenStreetMap features and administrative units | © OpenStreetMap contributors |
+
+![A monthly tile: twelve calendar months from different years](docs/images/monthly.jpg)
+
+![A monotemporal tile: every layer](docs/images/monotemporal.jpg)
+
+The figures are drawn with `taco.ml` by [`docs/make_figures.py`](docs/make_figures.py).
+
+`facts/` beside the parts holds every tile's precomputed fact sheet, series facts and
+grids, so tasks and captions can be built without reading a pixel.
+
+Licence: CC-BY-SA-4.0, except the OpenStreetMap files (`osm.parquet`, `admin.parquet`)
+and `facts/`, which contains OpenStreetMap names and geometries: ODbL-1.0.
 
 ## Install
 
@@ -33,8 +53,9 @@ pip install "majortom-elliot-tasks[torch] @ git+https://github.com/elliot-projec
 
 Python 3.12+. The data are read with the TACO reader from
 [OscarPellicer/taco](https://github.com/OscarPellicer/taco), which pip builds from
-source: it needs CMake, Ninja and a C++20 compiler (set `CC`/`CXX` if the default is
-older).
+source: it needs a C++23 compiler, CMake, Ninja, pkg-config, libcurl 7.83 or newer and
+OpenSSL 3 or newer (on Ubuntu: `apt install build-essential cmake ninja-build pkg-config
+libcurl4-openssl-dev libssl-dev`; set `CC`/`CXX` if the default compiler is older).
 
 ## Get the data
 
@@ -43,27 +64,25 @@ are read:
 
 ```python
 import elliot_tasks as et
-et.configure(elliot='https://data.source.coop/major-tom/elliot-pretrain',
-             ext='hf://isp-uv-es/elliot-x-ext')
+et.configure(elliot='https://data.source.coop/major-tom/elliot-pretrain')
 ```
 
-To work from local copies, download ELLIOT-X-EXT (one part shown) and the overlay:
-
-```bash
-huggingface-cli download isp-uv-es/elliot-x-ext --repo-type dataset \
-    --include "burst/*" "elliot-pretrain-metadata-overlay.zip" --local-dir elliot-x-ext
-```
-
-and ELLIOT-Pretrain from its [Source Cooperative page](https://source.coop/major-tom/elliot-pretrain).
-Then:
+Or download the parts you need (see the [Source Cooperative page](https://source.coop/major-tom/elliot-pretrain))
+and point at the local copy:
 
 ```python
-et.configure(elliot='/data/elliot-pretrain', ext='/data/elliot-x-ext',
-             elliot_metadata='/data/elliot-x-ext/elliot-pretrain-metadata-overlay.zip')
+et.configure(elliot='/data/elliot-pretrain')
 ```
 
-The same three settings can be given as `ELLIOT_ROOT`, `ELLIOT_X_EXT_ROOT` and
-`ELLIOT_METADATA`.
+The root can also be given as `ELLIOT_ROOT`. When the root holds `facts/`, the package
+uses it automatically; `et.configure_facts(path)` or `ELLIOT_FACTS` point elsewhere.
+Text-only use needs only the facts:
+
+```python
+et.configure_facts('https://data.source.coop/major-tom/elliot-pretrain/facts')
+t = et.facts('monthly', 352)                       # no pixel is read
+et.examples_for(facts=t, available={'s2', 'dem'})
+```
 
 ## Use
 
@@ -123,7 +142,7 @@ or `ElliotTaskDataset(..., captions={cell: text})`.
 ## Tests
 
 ```bash
-ELLIOT_ROOT=... ELLIOT_X_EXT_ROOT=... pytest     # without the data, only the data-free tests run
+ELLIOT_ROOT=... pytest     # without the data, only the data-free tests run
 ```
 
 ## Licence and citation
