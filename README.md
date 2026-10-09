@@ -8,7 +8,22 @@ from it generates **captions** and **16 task families** (grounding, grids, count
 phenology, change), with **scorers** and a **PyTorch dataset**. Tasks are built on the
 fly, with new wording every epoch, and only from the modalities the model is given.
 
+![A monotemporal tile: every layer](docs/images/monotemporal.jpg)
+
+*Monotemporal, MT10_69U_13R (Maritime Region, Togo): Sentinel-2, Landsat, Sentinel-1 VV, the
+Sentinel-2 cloud mask, the Copernicus DEM and ESA WorldCover of one tile.*
+
+![A monthly tile: twelve calendar months from different years](docs/images/monthly.jpg)
+
+*Monthly, MT10_144U_406R (Amhara, Ethiopia): one Sentinel-2 frame per calendar month,
+from different years, with its cloud mask and the Sentinel-1 VV image paired with it;
+the dry season turns green with the rains.*
+
 ![A burst tile: Sentinel-2, cloud mask and Sentinel-1 over six acquisitions](docs/images/burst.jpg)
+
+*Burst, MT10_214U_768R (Maharashtra, India): six Sentinel-2 acquisitions about five
+days apart, with their cloud masks and the paired Sentinel-1 VV images. All three
+figures are read with `taco.ml` by [`docs/make_figures.py`](docs/make_figures.py).*
 
 ## Data
 
@@ -32,12 +47,6 @@ Each tile holds, on one 10 m grid:
 | cloud and shadow mask, one per Sentinel-2 and Landsat frame | OmniCloudMask |
 | ERA5 weather at each acquisition | Copernicus Climate Change Service |
 | OpenStreetMap features and administrative units | © OpenStreetMap contributors |
-
-![A monthly tile: twelve calendar months from different years](docs/images/monthly.jpg)
-
-![A monotemporal tile: every layer](docs/images/monotemporal.jpg)
-
-The figures are drawn with `taco.ml` by [`docs/make_figures.py`](docs/make_figures.py).
 
 `facts/` beside the parts holds every tile's precomputed fact sheet, series facts and
 grids, so tasks and captions can be built without reading a pixel.
