@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "majortom-elliot-tasks"
 version = "0.1.0"
-description = "Measured fact sheets, vision-language tasks and scorers over Major TOM ELLIOT-Pretrain and ELLIOT-X-EXT, read through TACO."
+description = "Vision-language tasks, captions and scorers over Major TOM ELLIOT-Pretrain, read through TACO."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
